@@ -1,0 +1,23 @@
+---
+- name: Copy sysbench
+  copy: 
+    src=sysbench_0.5-3.xenial_amd64.deb
+    dest=/tmp/sysbench_0.5-3.xenial_amd64.deb
+    owner=root
+    mode=0644
+
+- name: Install sysbench 
+  apt: 
+    deb: /tmp/sysbench_0.5-3.xenial_amd64.deb
+
+- name: create database sbtest on all clusters 
+  mysql_db: >
+    login_host={{ hostvars[item]['inventory_hostname'] }}
+    login_user={{ mysql.login_user }}
+    login_password={{ mysql.login_passwd }}
+    name=sbtest
+    state=present
+  when: hostvars[item]['mysql_role']  == "master"
+  with_inventory_hostnames: all:!proxysql
+
+

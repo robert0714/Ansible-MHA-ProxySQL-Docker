@@ -1,0 +1,7 @@
+---
+- hosts: proxysql
+  connection: local
+  roles:
+  - { role: proxysql }
+  - { role: mha }
+  - { role: sysbench }

@@ -1,0 +1,194 @@
+---
+- set_fact: lsb_release={{ ansible_lsb.codename }}
+
+
+- name: Download percona
+  get_url:  
+    url: "https://repo.percona.com/apt/percona-release_0.1-4.{{ lsb_release }}_all.deb"
+    dest: "/tmp/percona-release_0.1-4.{{ lsb_release }}_all.deb"
+ 
+- name: Install percona
+  apt: deb="/tmp/percona-release_0.1-4.{{ lsb_release }}_all.deb"
+  sudo: true
+
+
+- name: Install ProxySQL package and prerequisites 
+  apt:
+    name={{ item }}
+    update_cache=yes
+  with_items:
+      -   mysql-client 
+      -   python-mysqldb 
+      -   proxysql 
+
+
+#https://github.com/sysown/proxysql/blob/master/doc/configuration_system.md
+- name: generate proxysql.conf based on template
+  template:
+    src=proxysql.conf.j2
+    dest=/etc/proxysql.cnf
+
+
+- service: >
+    name=proxysql
+    state=running
+
+- wait_for: host={{ proxysql.admin.host }} port={{ proxysql.admin.port }}  delay=3 state=started 
+
+- name: create 'app' user on the mysql masters
+  mysql_user: >
+    login_host={{ hostvars[item]['inventory_hostname'] }}
+    login_user={{ mysql.login_user }} 
+    login_password={{ mysql.login_passwd }}
+    name={{ proxysql.app.user }}
+    password={{ proxysql.app.passwd }}  
+    priv={{ proxysql.app.priv }}
+    host={{ proxysql.app.host }}
+    state=present
+  when: hostvars[item]['mysql_role']  == "master" 
+  with_inventory_hostnames: all:!proxysql
+
+
+- name: create 'app' user on the mysql masters
+  mysql_user: >
+    login_host={{ hostvars[item]['inventory_hostname'] }}
+    login_user={{ mysql.login_user }} 
+    login_password={{ mysql.login_passwd }}
+    name="app{{ hostvars[item]['hostgroup'] }}"
+    password="app{{ hostvars[item]['hostgroup'] }}"  
+    priv={{ proxysql.app.priv }}
+    host={{ proxysql.app.host }}
+    state=present
+  when: hostvars[item]['mysql_role']  == "master" 
+  with_inventory_hostnames: all:!proxysql
+
+- name: Create 'monitor' user on the mysql masters 
+  mysql_user: >
+    login_host={{ hostvars[item]['inventory_hostname'] }}
+    login_user={{ mysql.login_user }} 
+    login_password={{ mysql.login_passwd }}
+    name={{ proxysql.monitor.user }}
+    password={{ proxysql.monitor.passwd }}  
+    priv={{ proxysql.monitor.priv }}
+    host={{ proxysql.monitor.host }}
+    state=present
+  when: hostvars[item]['mysql_role']  == "master" 
+  with_inventory_hostnames: all:!proxysql
+
+- name: proxysql | config | add ProxySQL app users
+  proxysql_mysql_users:
+    login_host:         "{{ proxysql.admin.host }}"
+    login_port:         "{{ proxysql.admin.port }}"
+    login_user:         "{{ proxysql.admin.user }}"
+    login_password:     "{{ proxysql.admin.passwd }}"
+    username:           "app{{ hostvars[item]['hostgroup'] }}"
+    password:           "app{{ hostvars[item]['hostgroup'] }}"
+    max_connections:    "{{ proxysql.app.max_conn }}"
+    default_hostgroup:  "{{ hostvars[item]['hostgroup'] }}"
+    state: present
+    load_to_runtime:    True
+  when: hostvars[item]['mysql_role']  == "master"
+  with_inventory_hostnames: all:!proxysql
+
+- name: proxysql | config | manage monitor username
+  proxysql_global_variables:
+    login_host:         "{{ proxysql.admin.host }}"
+    login_port:         "{{ proxysql.admin.port }}"
+    login_user:         "{{ proxysql.admin.user }}"
+    login_password:     "{{ proxysql.admin.passwd }}"
+    variable:           "mysql-monitor_username"
+    value:              "{{ proxysql.monitor.passwd }}"
+        
+- name: proxysql | config | manage monitor password 
+  proxysql_global_variables:
+    login_host:         "{{ proxysql.admin.host }}"
+    login_port:         "{{ proxysql.admin.port }}"
+    login_user:         "{{ proxysql.admin.user }}"
+    login_password:     "{{ proxysql.admin.passwd }}"
+    variable:           "mysql-monitor_password"
+    value:              "{{ proxysql.monitor.passwd }}"
+
+- name: proxysql | config | set global_variables
+  proxysql_global_variables:
+    login_host:         "{{ proxysql.admin.host }}"
+    login_port:         "{{ proxysql.admin.port }}"
+    login_user:         "{{ proxysql.admin.user }}"
+    login_password:     "{{ proxysql.admin.passwd }}"
+    variable:           "{{ item.key }}"
+    value:              "{{ item.value }}" 
+  with_dict: "{{ proxysql.global_variables }}"
+
+- name: proxysql | config | add replication hostgroups
+  proxysql_replication_hostgroups:
+    login_host:         "{{ proxysql.admin.host }}"
+    login_port:         "{{ proxysql.admin.port }}"
+    login_user:         "{{ proxysql.admin.user }}"
+    login_password:     "{{ proxysql.admin.passwd }}"
+    writer_hostgroup:   "{{ hostvars[item]['hostgroup'] }}"
+    reader_hostgroup:   "{{ hostvars[item]['hostgroup'] | int + 1  }}"
+    comment:            "{{ hostvars[item]['cluster'] }}"
+    load_to_runtime:    True
+    state: present
+  when: hostvars[item]['mysql_role']  == "master"
+  with_inventory_hostnames: all:!proxysql
+
+- name: Workaround - ProxySQL monitor runs DMLs on mysql_servers, disabling it while adding the servers
+  shell: >
+      mysql 
+      --user={{ proxysql.admin.user }}
+      --password={{ proxysql.admin.passwd }}
+      --host={{ proxysql.admin.host }}  
+      --port={{ proxysql.admin.port }}  
+      --execute "set mysql-monitor.enabled='false'; LOAD MYSQL VARIABLES TO RUNTIME;"
+
+
+- name: proxysql | config | add server
+  proxysql_backend_servers:
+    login_host:     "{{ proxysql.admin.host }}"
+    login_port:     "{{ proxysql.admin.port }}"
+    login_user:     "{{ proxysql.admin.user }}"
+    login_password: "{{ proxysql.admin.passwd }}"
+    hostname:       "{{ hostvars[item]['inventory_hostname']  }}"
+    hostgroup_id:   "{{ hostvars[item]['hostgroup'] }}"     
+    comment:        "{{ hostvars[item]['cluster'] }}"     
+    port:           "3306"
+    load_to_runtime: False 
+    state:           present
+  with_inventory_hostnames: all:!proxysql
+  register: servers
+
+- name: proxysql | config | load servers to runtime
+  proxysql_manage_config:
+    login_host:     "{{ proxysql.admin.host }}"
+    login_port:     "{{ proxysql.admin.port }}"
+    login_user:     "{{ proxysql.admin.user }}"
+    login_password: "{{ proxysql.admin.passwd }}"
+    action: LOAD
+    config_settings: "MYSQL SERVERS"
+    direction: TO
+    config_layer: RUNTIME
+  when: servers.changed
+
+- name: Enable ProxySQL monitor  
+  shell: >
+      mysql 
+      --user={{ proxysql.admin.user }}
+      --password={{ proxysql.admin.passwd }}
+      --host={{ proxysql.admin.host }}  
+      --port={{ proxysql.admin.port }}  
+      --execute "
+      set mysql-monitor.enabled='true'; LOAD MYSQL VARIABLES TO RUNTIME;"
+
+- name: create dict from the clusters 
+  set_fact:
+      clusters: "{{ clusters|default([]) + [ {'name': hostvars[item]['cluster'] , 'hostgroup': hostvars[item]['hostgroup'] , 'short_name': hostvars[item]['cluster']|regex_replace('^damp_server_(.*)$','\\1') }  ] }}"
+  when: hostvars[item]['mysql_role']  == "master"
+  with_inventory_hostnames: all:!proxysql
+
+- name: template
+  template:
+    src=proxysql_menu.sh.j2
+    dest=/usr/local/bin/proxysql_menu.sh
+    owner=root
+    group=root
+    mode=0755
